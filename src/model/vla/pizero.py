@@ -489,6 +489,77 @@ class PiZero(nn.Module, NoSyncBase):
             )
         return action
 
+    def get_vlm_embeddings(
+        self,
+        input_ids: torch.LongTensor,
+        pixel_values: torch.FloatTensor,
+        image_text_proprio_mask: torch.FloatTensor,
+        vlm_position_ids: torch.LongTensor,
+        proprio_position_ids: torch.LongTensor,
+        proprios: torch.FloatTensor,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        """Run the VLM+proprio forward pass and return two summary embeddings.
+
+        Both embeddings are derived from the VLM value states in the KV cache —
+        the signal that action generation attends to at each transformer layer.
+        Value states are mean-pooled over VLM tokens (image patches + text) and
+        then flattened across heads, yielding a single vector per batch element.
+
+        The two embeddings differ in which layers they summarise:
+
+        - ``all_layers_embedding``: value states averaged across all N layers,
+          reflecting the full depth of VLM processing. Layer N-1 is included
+          since its frozen pretrained v_proj provides a meaningful projection
+          of the deepest hidden state.
+
+        - ``last_layer_embedding``: value states from layer N-1 (the last layer),
+          a pretrained frozen projection of the deepest VLM hidden state.
+
+        Args:
+            input_ids: text and image placeholder token ids [B, seq_len].
+            pixel_values: raw image pixels [B, C, H, W].
+            image_text_proprio_mask: block causal mask covering VLM + proprio
+                tokens, as produced by ``build_causal_mask_and_position_ids`` +
+                ``split_full_mask_into_submasks``.
+            vlm_position_ids: position ids for VLM tokens [B, max_image_text_tokens].
+            proprio_position_ids: position ids for proprio tokens [B, num_proprio_tokens].
+            proprios: proprioceptive state [B, cond_steps, proprio_dim].
+
+        Returns:
+            all_layers_embedding: mean-pooled VLM value states averaged over all
+                N layers, shape [B, Num_Heads_KV * Head_Dim].
+            last_layer_embedding: mean-pooled VLM value states from layer N-2,
+                shape [B, Num_Heads_KV * Head_Dim].
+        """
+        inputs_embeds = self._forward_siglip_and_text_embedding(input_ids, pixel_values)
+        proprio_embeds = self.proprio_encoder(proprios)
+
+        kv_caches = self.joint_model.build_mixture_caches()
+        _, kv_caches = self.joint_model(
+            attention_mask=image_text_proprio_mask,
+            position_ids_all={
+                "vlm": vlm_position_ids,
+                "proprio": proprio_position_ids,
+            },
+            embeds_all={
+                "vlm": inputs_embeds,
+                "proprio": proprio_embeds,
+            },
+            kv_caches=kv_caches,
+            return_caches=True,
+        )
+
+        # list of N tensors, each [B, Num_Heads_KV, num_vlm_tokens, Head_Dim]
+        vlm_value_cache = kv_caches["vlm"].value_cache
+
+        # all layers: mean over layers and tokens, flatten heads -> [B, Num_Heads_KV * Head_Dim]
+        all_layers_embedding = torch.stack(vlm_value_cache).mean(dim=(0, 3)).flatten(1)
+
+        # layer N-1: mean over tokens, flatten heads -> [B, Num_Heads_KV * Head_Dim]
+        last_layer_embedding = vlm_value_cache[-1].mean(dim=2).flatten(1)
+
+        return all_layers_embedding, last_layer_embedding
+
     def infer_action_naive(
         self,
         input_ids: torch.LongTensor,

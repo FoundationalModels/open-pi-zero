@@ -1,13 +1,15 @@
 """
 Extract Pi0 VLM embeddings for each task/instruction pair in ref_exp.json.
 
-Two weight sets are supported in a single run:
+Three weight sets are supported in a single run:
   1. Base pretrained PaliGemma weights (no Bridge fine-tuning) — always extracted.
-  2. A post-trained Pi0 .pt checkpoint — extracted when --checkpoint_path is given.
+  2. A Pi0 bridge-pretrained .pt checkpoint — extracted when --pi0_pretrained_path is given.
+  3. A task-specific post-trained Pi0 .pt checkpoint — extracted when --checkpoint_path is given.
 
 Output files per task:
   {task_name}_{paligemma_model_name}_pretrained_embds.npz
-  {task_name}_{checkpoint_stem}_finetuned_embds.npz   (only when checkpoint provided)
+  {task_name}_{checkpoint_stem}_pi0pretrained_embds.npz   (only when --pi0_pretrained_path given)
+  {task_name}_{checkpoint_stem}_finetuned_embds.npz       (only when --checkpoint_path given)
 """
 
 import argparse
@@ -29,8 +31,7 @@ from src.model.vla.processing import VLAProcessor
 
 PALIGEMMA_REPO_ID = "google/paligemma-3b-pt-224"
 _DEFAULT_PRETRAINED_PATH = os.path.join(
-    os.environ.get("TRANSFORMERS_CACHE", os.path.expanduser("~/.cache/huggingface")),
-    "paligemma-3b-pt-224",
+    os.path.dirname(__file__), "../../checkpoints/pi0_basevlm_paligemma-3b-pt-224"
 )
 
 
@@ -190,10 +191,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--pi0_pretrained_path",
+        default=None,
+        help="Path to a Pi0 bridge-pretrained .pt checkpoint (general robot training, "
+             "not task-specific). When provided, extracted with suffix _pi0pretrained_embds.",
+    )
+    parser.add_argument(
         "--checkpoint_path",
         default=None,
-        help="Path to a post-trained Pi0 .pt checkpoint.  When provided, finetuned "
-             "embeddings are extracted in addition to pretrained ones.",
+        help="Path to a task-specific post-trained Pi0 .pt checkpoint.  When provided, "
+             "finetuned embeddings are extracted in addition to pretrained ones.",
     )
     parser.add_argument(
         "--config_path",
@@ -228,8 +235,10 @@ def main():
 
     print(f"PaliGemma base: {paligemma_name}")
     print(f"Device: {device}  Dtype: {dtype}")
+    if args.pi0_pretrained_path:
+        print(f"Pi0 bridge-pretrained checkpoint: {args.pi0_pretrained_path}")
     if args.checkpoint_path:
-        print(f"Post-trained checkpoint: {args.checkpoint_path}")
+        print(f"Task-specific checkpoint: {args.checkpoint_path}")
 
     # Build model architecture (shared across both weight sets)
     print("\nBuilding Pi0 model...")
@@ -257,7 +266,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Phase 1: base pretrained PaliGemma weights (no Bridge fine-tuning) ──
-    print("\n=== Extracting PRETRAINED embeddings ===")
+    print("\n=== Extracting BASE embeddings (PaliGemma) ===")
     model.load_pretrained_weights()
     model.freeze_all_weights()
     run_extraction(
@@ -267,10 +276,22 @@ def main():
         file_suffix=f"{paligemma_name}_pretrained_embds",
     )
 
-    # ── Phase 2: post-trained checkpoint weights (optional) ──
+    # ── Phase 2: Pi0 bridge-pretrained checkpoint (optional) ──
+    if args.pi0_pretrained_path:
+        pi0_pretrained_stem = os.path.splitext(os.path.basename(args.pi0_pretrained_path))[0]
+        print(f"\n=== Extracting PI0-PRETRAINED embeddings ({pi0_pretrained_stem}) ===")
+        load_checkpoint(model, args.pi0_pretrained_path)
+        run_extraction(
+            model, processor, tasks,
+            args.image_base_dir, config, device, dtype,
+            args.output_dir,
+            file_suffix=f"{pi0_pretrained_stem}_pi0pretrained_embds",
+        )
+
+    # ── Phase 3: task-specific post-trained checkpoint (optional) ──
     if args.checkpoint_path:
         checkpoint_stem = os.path.splitext(os.path.basename(args.checkpoint_path))[0]
-        print(f"\n=== Extracting FINETUNED embeddings  ({checkpoint_stem}) ===")
+        print(f"\n=== Extracting FINETUNED embeddings ({checkpoint_stem}) ===")
         load_checkpoint(model, args.checkpoint_path)
         run_extraction(
             model, processor, tasks,

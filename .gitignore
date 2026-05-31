@@ -1,3 +1,8 @@
+# IDE files
+.idea/
+.vscode/
+*.code-workspace
+
 launch.sh
 uv.lock
 temp/
